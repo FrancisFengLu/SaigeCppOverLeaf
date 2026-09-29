@@ -219,4 +219,59 @@ Parallel workers maintain local $b$ and $C$ accumulators, which are
 combined before the final correction. This description concerns the
 single-vector path, not the separate multiple-right-hand-side kernels.
 
+\section{GPU version: differences from CPU AVX2}
+\label{sec:gpu-cpu-differences}
+
+For the same preprocessed genotypes, the packed GPU implementation
+evaluates the same product $y=A(A^\top x)/M$ in
+Equation~\eqref{eq:avx2-target}. It uses the same quantities
+$S_x,r_j,t_j,s_j,b_i,C$ and the same standardization identities.
+The comparison below concerns execution and data movement in the
+single-vector path.\footnote{GPU implementation at snapshot
+\texttt{5a9e4135a76d}:
+\href{https://github.com/FrancisFengLu/SAIGE-cpp-comparison/blob/5a9e4135a76dab73d73274e930f27524c9712958/SAIGE_cpp_260716/step1_saige-null/tools/gpu_matvec/gemv2bit.cu}{\texttt{gemv2bit.cu}},
+including \texttt{matvec\_range} and its six main kernel launches.}
+
+\paragraph{Execution order and intermediate results.}
+Each CPU worker completes the dot product and output update for one
+marker before proceeding to the next. Its second pass can therefore
+reuse recently accessed packed data in cache.
+The GPU instead computes marker coefficients across the selected
+marker range before beginning the output pass.
+It stores tile-level partial sums and marker coefficients in device
+memory between kernels. The second pass revisits the packed matrix,
+forms output partial sums, and combines them before applying
+$(b_i-C)/M$. Both paths decode genotypes in two passes; the GPU does
+not keep the entire decoded matrix in registers between passes.
+
+\paragraph{Memory hierarchy and parallel computation.}
+The CPU path uses system DRAM, L3/L2/L1 caches, and AVX2 registers.
+On the V100, the GPU path uses HBM2 device memory, shared L2 cache,
+per-streaming-multiprocessor L1/shared memory, and per-thread registers.
+CUDA shared memory is explicitly used to reuse input-vector tiles
+within thread blocks; it is distinct from a hardware-managed cache.
+GPU threads decode packed values into registers and perform FP32
+arithmetic, with parallel reductions combining partial results.
+As on the CPU, cache hits can avoid accesses to more distant memory.
+These levels should not be interpreted as a mandatory serial path.
+
+\paragraph{Host--device transfers.}
+The GPU implementation uploads the packed matrix when its resident
+context is initialized and reuses it across subsequent calls.
+Each single-vector call transfers $x$ to the device and returns $y$
+to the host; intermediate reductions remain on the device.
+The CPU implementation has no corresponding host--device transfers.
+
+\paragraph{What the optimization removes.}
+The original CPU path already stores packed genotypes, but expands
+one marker into an FP32 temporary array before computation.
+The AVX2 optimization removes that array's stores and reloads.
+Relative to a dense FP32 GPU baseline, the packed GPU path also
+reduces the resident genotype matrix payload by a factor of 16.
+It reads packed values instead of the expanded matrix in both passes.
+This ratio excludes vectors, coefficients, partial sums, padding, and
+cache effects; it does not predict an end-to-end speedup.
+Attributing speedups to L3 or HBM2 bandwidth requires profiling.
+Optional masking and sparse correction operations are omitted here.
+
 \end{document}
