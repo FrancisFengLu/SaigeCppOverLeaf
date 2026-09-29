@@ -1,5 +1,7 @@
 \documentclass{article}
 \usepackage{graphicx} % Required for inserting images
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
 
 \title{SaigeCpp}
 \author{Feng Lu }
@@ -13,5 +15,208 @@
 
 \section{VR Trace Formula}
 \section{C++}
+
+\subsection{AVX2 Math}
+\label{sec:avx2-math}
+
+\subsubsection{The matrix--vector product and one marker's contribution}
+
+Let $N$ denote the number of samples and $M$ the number of markers
+included in this genetic relationship matrix (GRM) calculation.
+For marker $j$, let $g_{ij}$ be the genotype decoded from the packed
+store for sample $i$ after the existing preprocessing.
+The stored genotype values are $0$, $1$, or $2$.
+Let $p_j$ denote the allele frequency and $d_j$ the precomputed
+standardization factor, conventionally $[2p_j(1-p_j)]^{-1/2}$ for a
+polymorphic marker. Both quantities are marker-specific and are shared
+by all samples at that marker.
+
+Define the standardized genotype vector and matrix by
+\begin{equation}
+ a_{ij}=(g_{ij}-2p_j)d_j,\qquad
+ a_j\in\mathbb{R}^{N},\qquad
+ A=[a_1,\ldots,a_M]\in\mathbb{R}^{N\times M}.
+\end{equation}
+For one input vector $x\in\mathbb{R}^{N}$, the required operation is
+\begin{equation}
+ \boxed{y=Kx=\frac{1}{M}A(A^\top x)},\qquad
+ K=\frac{1}{M}AA^\top.
+ \label{eq:avx2-target}
+\end{equation}
+The transpose is essential; the full $N\times N$ matrix $K$ need not
+be constructed to evaluate this product.
+
+Expanding Equation~\eqref{eq:avx2-target} over the columns of $A$ gives
+\begin{equation}
+ y=\frac{1}{M}\sum_{j=1}^{M}a_jt_j,
+ \qquad t_j=a_j^\top x.
+ \label{eq:avx2-marker}
+\end{equation}
+Here $t_j$ is a scalar, whereas $a_jt_j$ is an $N$-element vector.
+Each call processes one input vector $x$ and accumulates marker
+contributions $a_jt_j$ into the same output vector $y$.
+This is the GRM component of a preconditioned conjugate-gradient
+(PCG) operator; other covariance terms are outside this derivation.
+
+\subsubsection{Original CPU implementation}
+
+Initialize an output accumulator $z=0$. For each marker $j$, perform
+the following operations in order.
+\begin{enumerate}
+ \item \textbf{Decode and store the standardized genotype vector.}
+ Decode each packed genotype and obtain its standardized
+ single-precision floating-point (FP32) value,
+ \begin{equation}
+  a_{ij}=(g_{ij}-2p_j)d_j,\qquad i=1,\ldots,N.
+ \end{equation}
+ The implementation precomputes the three possible standardized values
+ for this marker and selects them by lookup. It writes all $N$ values
+ into a temporary FP32 array $a_j$.
+
+ \item \textbf{Read the temporary array and compute a dot product.}
+ Load batches of $a_j$ and $x$ into registers and accumulate
+ \begin{equation}
+  t_j=\sum_{i=1}^{N}a_{ij}x_i.
+ \end{equation}
+ Partial sums are combined to obtain the scalar $t_j$.
+
+ \item \textbf{Read the temporary array again and update the output.}
+ With $t_j$ fixed, update every sample position,
+ \begin{equation}
+  z_i\leftarrow z_i+t_ja_{ij},\qquad i=1,\ldots,N.
+ \end{equation}
+ This step loads the current output values and stores their updates.
+\end{enumerate}
+After all markers have been processed, return $y=z/M$.
+The same temporary genotype array is read for the dot product and
+again for the output accumulation.
+
+\subsubsection{Modified CPU implementation: fused AVX2 decoding}
+
+The optimized single-vector path uses Advanced Vector Extensions 2
+(AVX2) to decode packed genotypes in batches and immediately compute
+with their FP32 values. It avoids the full array $a_j$ by rearranging
+standardization as follows.
+
+\begin{enumerate}
+ \item \textbf{Prepare quantities shared by all markers.}
+ Compute the input sum once and initialize the accumulators,
+ \begin{equation}
+  S_x=\sum_{i=1}^{N}x_i,\qquad b=0,\qquad C=0.
+ \end{equation}
+ Here $b$ is an $N$-element vector and $C$ is a scalar.
+
+ \item \textbf{First pass: decode and accumulate the raw dot product.}
+ For marker $j$, decode batches of $g_{ij}$ to FP32 and immediately
+ multiply them by the corresponding input values,
+ \begin{equation}
+  r_j=\sum_{i=1}^{N}g_{ij}x_i.
+ \end{equation}
+ The decoded FP32 values represent $0.0$, $1.0$, or $2.0$;
+ they have not yet been standardized.
+
+ \item \textbf{Recover the standardized dot product.}
+ Apply the marker-specific correction after the reduction,
+ \begin{align}
+  t_j
+   &=\sum_{i=1}^{N}(g_{ij}-2p_j)d_jx_i \notag\\
+   &=d_j\left(r_j-2p_jS_x\right).
+   \label{eq:avx2-dot-correction}
+ \end{align}
+ This gives the same mathematical scalar as the original dot product.
+
+ \item \textbf{Second pass: decode again and accumulate the output.}
+ Define $s_j=d_jt_j$. The contribution of marker $j$ separates as
+ \begin{equation}
+  t_ja_{ij}=s_jg_{ij}-2p_js_j.
+ \end{equation}
+ Decode the packed marker again in batches and update
+ \begin{equation}
+  b_i\leftarrow b_i+s_jg_{ij},\qquad i=1,\ldots,N.
+ \end{equation}
+ The second term is identical for all samples, so accumulate it once
+ per marker in the scalar offset,
+ \begin{equation}
+  C\leftarrow C+2p_js_j.
+ \end{equation}
+ Repeat steps 2--4 for each included marker.
+
+ \item \textbf{Apply the accumulated offset and normalize.}
+ After all markers have been processed, return
+ \begin{equation}
+  \boxed{y_i=\frac{b_i-C}{M}},\qquad i=1,\ldots,N.
+ \end{equation}
+ Equivalence follows directly from
+ \begin{equation}
+  b_i-C=\sum_{j=1}^{M}s_j(g_{ij}-2p_j)
+       =\sum_{j=1}^{M}t_ja_{ij}.
+ \end{equation}
+\end{enumerate}
+The identities hold in exact arithmetic; floating-point reduction
+order and fused multiply-add instructions can change rounding.
+
+\subsubsection{Registers, L1/L2/L3 caches, and the avoided array traffic}
+
+The relevant memory hierarchy comprises system DRAM, shared L3 cache,
+private L2 and L1 data caches, and the registers within a CPU core.
+Our focus is data movement between the cache hierarchy, including L3,
+and registers, rather than a change in genotype precision during
+floating-point arithmetic.
+
+L3 and registers are not a direct, mandatory transfer pair.
+A load that hits L1 can obtain its data without accessing L2, L3,
+or DRAM. Cache fills and evictions depend on the processor and
+working set; some Xeon cache fills bypass L3.\footnote{Intel,
+\href{https://www.intel.com/content/www/us/en/developer/articles/technical/xeon-processor-scalable-family-technical-overview.html}{Xeon Processor Scalable Family Technical Overview},
+``Cache Hierarchy Changes.''}
+
+In the original path, decoded standardized values are stored from
+registers into a temporary array, normally through L1.
+The dot product and accumulation subsequently reload that array.
+Its cache lines may occupy L1, L2, or L3, and dirty evictions may
+eventually reach DRAM. Thus, these array accesses cannot all be
+counted as either L3 traffic or DRAM traffic.
+
+The modified path avoids the complete FP32 genotype array and its
+stores and reloads. Each decoded batch is consumed in registers;
+operand registers can then be reused while partial sums are retained.
+The second pass decodes again because its coefficient $s_j$ depends
+on the completed first-pass reduction. Loads of $x$ and loads and
+stores of the output accumulator remain necessary.
+
+Single-instruction, multiple-data (SIMD) instructions process several
+values together. An AVX2 vector register contains 256 bits and holds
+eight FP32 values.
+The implementation loads 32 packed bytes representing 128 genotypes,
+then converts and consumes them in batches of eight FP32 values.
+It does not retain all 128 expanded values in one register.
+The first pass uses four vector accumulators before reducing their
+partial sums to a scalar.
+
+For $N=50{,}000$, one marker occupies 12.5~kB in 2-bit storage,
+whereas its full FP32 temporary array occupies 200~kB
+($1~\mathrm{kB}=1000$ bytes). Both implementations already retain
+packed input, so this size ratio is not a new sixteenfold reduction
+in the original input store or a predicted speedup.
+The optimization combines SIMD decoding, removal of temporary-array
+traffic, and algebraic treatment of standardization.
+Attribution of a measured speedup specifically to L3 bandwidth or
+cache misses requires profiling; the code alone does not establish
+L3 as the bottleneck.
+
+\paragraph{Implementation correspondence.}
+The function \texttt{pass1\_sum\_gx} computes $r_j$,
+and its caller applies Equation~\eqref{eq:avx2-dot-correction}.
+\texttt{pass2\_axpy} updates $b$, while the caller accumulates $C$ and
+applies the final correction and normalization.\footnote{Implementation
+snapshot \texttt{5a9e4135a76d}, with the full revision pinned in the links to
+\href{https://github.com/FrancisFengLu/SAIGE-cpp-comparison/blob/5a9e4135a76dab73d73274e930f27524c9712958/SAIGE_cpp_260716/step1_saige-null/tools/avx2_kernel/avx2_kernel.hpp}{\texttt{avx2\_kernel.hpp}}
+and
+\href{https://github.com/FrancisFengLu/SAIGE-cpp-comparison/blob/5a9e4135a76dab73d73274e930f27524c9712958/SAIGE_cpp_260716/step1_saige-null/SAIGE_step1_fast.cpp}{\texttt{SAIGE\_step1\_fast.cpp}}.}
+The equations use natural sample order; the implementation internally
+permutes samples for vectorization and restores their order afterward.
+Parallel workers maintain local $b$ and $C$ accumulators, which are
+combined before the final correction. This description concerns the
+single-vector path, not the separate multiple-right-hand-side kernels.
 
 \end{document}
